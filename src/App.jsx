@@ -3,7 +3,7 @@ import CustomChat from "./components/CustomChat";
 import { SessionProvider, useSession } from "./SessionContext";
 import "./App.css";
 
-const BACKEND_URL = 'http://localhost:5000';// Replace with your backend URL
+const BACKEND_URL = import.meta.env.VITE_PUBLIC_BACKEND_URL;
 
 function AppContent() {
   const { setSessionId } = useSession();
