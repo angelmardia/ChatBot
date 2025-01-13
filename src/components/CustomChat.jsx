@@ -4,9 +4,9 @@ import { useState, useEffect, useRef } from "react";
 import { Mic, MicOff, Volume2, VolumeX, Send } from "lucide-react";
 import { useSession } from "@/SessionContext";
 
-const BACKEND_URL = 'http://localhost:5000';
-const ASR_WEBSOCKET_URL = 'ws://localhost:8765';
-const TTS_WEBSOCKET_URL = 'ws://localhost:8766';
+const BACKEND_URL = import.meta.env.VITE_PUBLIC_BACKEND_URL;
+const SILENCE_THRESHOLD = -50;
+const SILENCE_DURATION = 1500;
 
 export function LocalChat() {
     const { sessionId, setSessionId } = useSession();
@@ -18,93 +18,21 @@ export function LocalChat() {
     const [instructionId, setInstructionId] = useState("1");
     const [customInstruction, setCustomInstruction] = useState("");
     const [instructions, setInstructions] = useState({});
-    const [ttsConnected, setTtsConnected] = useState(false);
+    const [errorMessage, setErrorMessage] = useState("");
 
     const messagesEndRef = useRef(null);
-    const asrSocketRef = useRef(null);
-    const ttsSocketRef = useRef(null);
     const mediaRecorderRef = useRef(null);
     const audioChunksRef = useRef([]);
-    const reconnectAttemptsRef = useRef(0);
-    const maxReconnectAttempts = 5;
+    const audioContextRef = useRef(null);
+    const audioSourceRef = useRef(null);
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     };
 
-    // Auto-scroll when messages change
     useEffect(() => {
         scrollToBottom();
     }, [messages]);
-
-    // Initialize WebSocket connections
-    useEffect(() => {
-        const setupASRWebSocket = () => {
-            asrSocketRef.current = new WebSocket(ASR_WEBSOCKET_URL);
-            asrSocketRef.current.onmessage = handleASRMessage;
-            asrSocketRef.current.onerror = (error) => console.error('ASR WebSocket error:', error);
-            asrSocketRef.current.onclose = () => {
-                console.log('ASR WebSocket closed. Reconnecting...');
-                setTimeout(setupASRWebSocket, 5000);
-            };
-        };   
-
-        setupASRWebSocket();
-
-        return () => {
-            asrSocketRef.current?.close();
-        };
-    }, [instructionId, customInstruction, ttsConnected]);
-
-    useEffect(() => {
-        const setupTTSWebSocket = () => {
-            if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
-                console.error('Max reconnection attempts reached for TTS WebSocket');
-                return;
-            }
-
-            try {
-                if (!ttsSocketRef.current || ttsSocketRef.current.readyState === WebSocket.CLOSED) {
-                    console.log('Establishing TTS WebSocket connection...');
-                    ttsSocketRef.current = new WebSocket(TTS_WEBSOCKET_URL);
-
-                    ttsSocketRef.current.onopen = () => {
-                        console.log('TTS WebSocket connected');
-                        setTtsConnected(true);
-                        reconnectAttemptsRef.current = 0;
-                    };
-
-                    ttsSocketRef.current.onmessage = handleTTSMessage;
-
-                    ttsSocketRef.current.onclose = (event) => {
-                        console.log(`TTS WebSocket closed with code: ${event.code}. Retrying...`);
-                        setTtsConnected(false);
-                        reconnectAttemptsRef.current += 1;
-                        setTimeout(setupTTSWebSocket, 5000);
-                    };
-
-                    ttsSocketRef.current.onerror = (error) => {
-                        console.error('TTS WebSocket error:', error);
-                        setTtsConnected(false);
-                        reconnectAttemptsRef.current += 1;
-                        setTimeout(setupTTSWebSocket, 5000);
-                    };
-                } else {
-                    console.log('TTS WebSocket is already open');
-                }
-            } catch (error) {
-                console.error('Error setting up TTS WebSocket:', error);
-                reconnectAttemptsRef.current += 1;
-                setTimeout(setupTTSWebSocket, 5000);
-            }
-        };
-
-        setupTTSWebSocket();
-
-        return () => {
-            ttsSocketRef.current?.close();
-        };
-    }, []);
 
     useEffect(() => {
         fetch(`${BACKEND_URL}/instruction_sets`, {
@@ -122,91 +50,97 @@ export function LocalChat() {
             .catch((err) => console.error("Failed to fetch instruction sets:", err));
     }, []);
 
-    const handleASRMessage = (event) => {
+    const processAudioToText = async (audioBase64) => {
         try {
-            const response = JSON.parse(event.data);
-            console.log('ASR WebSocket message received:', response);
+            setErrorMessage(""); // Clear any previous errors
+            const response = await fetch(`${BACKEND_URL}/speech-to-text`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    "ngrok-skip-browser-warning": "true"
+                },
+                body: JSON.stringify({
+                    audio: audioBase64,
+                    format: 'webm'
+                })
+            });
 
-            if (response.status === "success" && response.text) {
-                console.log('ASR recognized text:', response.text);
-                setInput(response.text);
-                const selectedInstructionId = customInstruction || instructionId;
-                const ttsStatus = ttsConnected;
-                sendMessage(response.text, selectedInstructionId, ttsStatus);
-            }
-        } catch (error) {
-            console.error("Error processing ASR WebSocket message:", error);
-        }
-    };
-
-    const handleTTSMessage = (event) => {
-        console.log('Received TTS message:', event.data);
-        try {
-            const response = JSON.parse(event.data);
-            if (response.error) {
-                console.error('TTS error:', response.error);
-                return;
-            }
-            if (response.audio) {
-                console.log('Received audio data, attempting playback');
-                playAudio(response.audio);
+            const data = await response.json();
+            if (data.status === "success" && data.text) {
+                console.log('Speech recognition result:', data.text);
+                setInput(data.text);
+                sendMessage(data.text);
             } else {
-                console.log('No audio data in response:', response);
+                console.error('Speech recognition failed:', data.message);
+                setErrorMessage(data.message || "Speech recognition failed. Please try again.");
+                stopRecording();
             }
         } catch (error) {
-            console.error("Error processing TTS message:", error);
+            console.error("Error in speech recognition:", error);
+            setErrorMessage("Connection failed. Please check your internet connection and try again.");
+            stopRecording();
         }
     };
 
-    const playAudio = (base64Audio) => {
+
+    const synthesizeSpeech = async (text) => {
         try {
-            // Create audio context
-            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            
-            // Convert base64 to array buffer
+            console.log('Requesting speech synthesis for:', text);
+            const response = await fetch(`${BACKEND_URL}/text-to-speech`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    "ngrok-skip-browser-warning": "true"
+                },
+                body: JSON.stringify({
+                    text: text,
+                    voice_idx: 0
+                })
+            });
+
+            const data = await response.json();
+            if (data.status === "success" && data.audio) {
+                console.log('Received audio data, playing...');
+                await playAudio(data.audio);
+            } else {
+                console.error('Speech synthesis failed:', data.message);
+            }
+        } catch (error) {
+            console.error("Error in speech synthesis:", error);
+        }
+    };
+
+    const playAudio = async (base64Audio) => {
+        try {
+            if (!audioContextRef.current) {
+                audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            // Stop any currently playing audio
+            if (audioSourceRef.current) {
+                audioSourceRef.current.stop();
+                audioSourceRef.current = null;
+            }
+
             const binaryString = window.atob(base64Audio);
-            const len = binaryString.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) {
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
                 bytes[i] = binaryString.charCodeAt(i);
             }
-            
-            // Decode audio data
-            audioContext.decodeAudioData(bytes.buffer)
-                .then(buffer => {
-                    const source = audioContext.createBufferSource();
-                    source.buffer = buffer;
-                    source.connect(audioContext.destination);
-                    source.onended = () => setIsSpeaking(false);
-                    setIsSpeaking(true);
-                    source.start(0);
-                })
-                .catch(error => {
-                    console.error("Error decoding audio data:", error);
-                    setIsSpeaking(false);
-                });
+
+            setIsSpeaking(true);
+            const audioBuffer = await audioContextRef.current.decodeAudioData(bytes.buffer);
+            audioSourceRef.current = audioContextRef.current.createBufferSource();
+            audioSourceRef.current.buffer = audioBuffer;
+            audioSourceRef.current.connect(audioContextRef.current.destination);
+            audioSourceRef.current.onended = () => {
+                setIsSpeaking(false);
+                audioSourceRef.current = null;
+            };
+            audioSourceRef.current.start(0);
         } catch (error) {
             console.error("Error playing audio:", error);
             setIsSpeaking(false);
-        }
-    };
-
-    const sendTTSRequest = (text) => {
-        if (!ttsSocketRef.current || ttsSocketRef.current.readyState !== WebSocket.OPEN) {
-            console.error('TTS WebSocket is not connected or ready');
-            return;
-        }
-
-        try {
-            console.log('Sending TTS request for text:', text);
-            const message = JSON.stringify({
-                text: text,
-                speaker_idx: 7308
-            });
-            ttsSocketRef.current.send(message);
-            console.log('TTS request sent successfully');
-        } catch (error) {
-            console.error('Error sending TTS request:', error);
         }
     };
 
@@ -221,7 +155,8 @@ export function LocalChat() {
     const startRecording = async () => {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorderRef.current = new MediaRecorder(stream);
+            mediaRecorderRef.current = new MediaRecorder(stream)
+;
             audioChunksRef.current = [];
 
             mediaRecorderRef.current.ondataavailable = (event) => {
@@ -233,11 +168,7 @@ export function LocalChat() {
                 const reader = new FileReader();
                 reader.onload = () => {
                     const base64Audio = reader.result.split(',')[1];
-                    asrSocketRef.current?.send(JSON.stringify({
-                        type: "audio",
-                        audio: base64Audio,
-                        format: "webm"
-                    }));
+                    processAudioToText(base64Audio);
                 };
                 reader.readAsDataURL(audioBlob);
             };
@@ -257,6 +188,21 @@ export function LocalChat() {
         }
     };
 
+    const toggleSpeaking = () => {
+        if (isSpeaking && audioSourceRef.current) {
+            audioSourceRef.current.stop();
+            audioSourceRef.current = null;
+            setIsSpeaking(false);
+        } else if (messages.length > 0) {
+            const lastAssistantMessage = messages
+                .filter(m => m.role === "assistant")
+                .pop();
+            if (lastAssistantMessage) {
+                synthesizeSpeech(lastAssistantMessage.content);
+            }
+        }
+    };
+
     const sendMessage = async (messageContent) => {
         if (!messageContent.trim()) return;
 
@@ -270,7 +216,10 @@ export function LocalChat() {
 
             const response = await fetch(`${BACKEND_URL}/chat`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json", "ngrok-skip-browser-warning": "true" },
+                headers: { 
+                    "Content-Type": "application/json",
+                    "ngrok-skip-browser-warning": "true"
+                },
                 body: JSON.stringify({
                     session_id: sessionId,
                     instruction_id: selectedInstructionId,
@@ -282,13 +231,7 @@ export function LocalChat() {
             if (response.ok) {
                 const botResponse = { role: "assistant", content: data.response };
                 setMessages((prev) => [...prev, botResponse]);
-
-                if (ttsSocketRef.current && ttsSocketRef.current.readyState === WebSocket.OPEN) {
-                    console.log('Triggering TTS with:', data.response);
-                    sendTTSRequest(data.response);
-                } else {
-                    console.log('TTS not connected or ready. Skipping speech synthesis.');
-                }
+                synthesizeSpeech(data.response);
             }
         } catch (err) {
             console.error("Failed to send message:", err);
@@ -362,12 +305,19 @@ export function LocalChat() {
                             </div>
                         </div>
                     )}
-                    <div ref={messagesEndRef} /> {/* Add this invisible element for scrolling */}
+                    <div ref={messagesEndRef} />
                 </div>
+                {errorMessage && (
+                    <div className="mb-4 p-3 bg-red-100 text-red-700 rounded-lg">
+                        {errorMessage}
+                    </div>
+                )}
                 <div className="flex items-center gap-2 mb-4">
                     <button
                         onClick={toggleListening}
-                        className={`p-2 rounded-lg border ${isListening ? "bg-red-100" : "hover:bg-gray-100"}`}
+                        className={`p-2 rounded-lg border ${
+                            isListening ? "bg-red-100" : "hover:bg-gray-100"
+                        } ${errorMessage ? "border-red-500" : ""}`}
                     >
                         {isListening ? (
                             <MicOff className="h-4 w-4" />
@@ -376,7 +326,7 @@ export function LocalChat() {
                         )}
                     </button>
                     <button
-                        onClick={() => setIsSpeaking(!isSpeaking)}
+                        onClick={toggleSpeaking}
                         disabled={!messages.length}
                         className="p-2 rounded-lg border hover:bg-gray-100 disabled:opacity-50"
                     >
@@ -386,7 +336,6 @@ export function LocalChat() {
                             <Volume2 className="h-4 w-4" />
                         )}
                     </button>
-                   
                 </div>
                 <form onSubmit={handleSubmit} className="flex gap-2">
                     <input
@@ -405,7 +354,7 @@ export function LocalChat() {
                     </button>
                 </form>
             </div>
-         </div>
+        </div>
     );
 }
 
